@@ -1,12 +1,13 @@
 #!/bin/bash
 # リリースビルドして build/TranslucentCalendar.app を作る
 #   ./build.sh           ビルドのみ
-#   ./build.sh install   ビルドして ~/Applications に入れ、起動し直す
+#   ./build.sh install   ビルドして /Applications に入れ、起動し直す
+#                        （INSTALL_DIR=... で入れる先を変えられる）
 set -euo pipefail
 cd "$(dirname "$0")"
 
 APP="build/TranslucentCalendar.app"
-INSTALL_DIR="$HOME/Applications"
+INSTALL_DIR="${INSTALL_DIR:-/Applications}"
 
 swift build -c release
 BIN="$(swift build -c release --show-bin-path)/TranslucentCalendar"
@@ -34,7 +35,7 @@ echo "Built: $APP (signed with: $CODESIGN_IDENTITY)"
 
 if [[ "${1:-}" == "install" ]]; then
     # パスに末尾スペースなどがあるとメニューバーのアイコンが出ないことがあるため、
-    # 実際に使うアプリは ~/Applications に置く
+    # 実際に使うアプリは /Applications に置く（Launchpad や Spotlight にも出る）
     # 終了しきる前に開くと起動に失敗するので、少し待つ
     pkill -x TranslucentCalendar && sleep 1 || true
     mkdir -p "$INSTALL_DIR"

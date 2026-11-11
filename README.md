@@ -31,7 +31,9 @@ cd TranslucentCalendar
 ./build.sh install
 ```
 
-`./build.sh install` は、リリースビルドを作って `~/Applications/TranslucentCalendar.app` に置き、起動し直します。`./build.sh` だけなら `build/` にアプリを作るだけです。
+`./build.sh install` は、リリースビルドを作って `/Applications/TranslucentCalendar.app` に置き、起動し直します。`./build.sh` だけなら `build/` にアプリを作るだけです。
+
+入れる先を変えたいときは `INSTALL_DIR` で指定します（例: `INSTALL_DIR=~/Applications ./build.sh install`）。
 
 ### 初回の設定
 
@@ -95,7 +97,7 @@ CODESIGN_IDENTITY="Apple Development: Your Name (XXXXXXXXXX)" ./build.sh install
 ## 既知の問題
 
 - **メニューバー管理アプリとの相性**: macOS 26 以降で Thaw などを併用していると、メニューバーのアイコンが表示されなかったり、絵が崩れたりすることがあります。設定は箱の右クリックメニューからすべて操作できます。
-- **末尾にスペースのあるパス**: アプリを置くフォルダのパスの末尾にスペースがあると、メニューバーのアイコンが出ないことがあります。`./build.sh install` で `~/Applications` に置いて使ってください。
+- **末尾にスペースのあるパス**: アプリを置くフォルダのパスの末尾にスペースがあると、メニューバーのアイコンが出ないことがあります。`./build.sh install` で `/Applications` に置いて使ってください。
 - **Google との同期間隔**: 同期は macOS 任せなので、Google 側の変更が反映されるまで数分かかることがあります。メニューの「今すぐ更新」で同期を促せます。
 - **会議リンクの検出**: 予定の URL・場所・メモに書かれたリンクから拾っています。カレンダー側がそこにリンクを入れていない予定では、参加ボタンが出ません。
 
