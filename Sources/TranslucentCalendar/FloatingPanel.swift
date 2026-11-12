@@ -35,8 +35,93 @@ final class FloatingPanel: NSPanel {
             NSMenu.popUpContextMenu(contextMenu, with: event, for: view)
             return
         }
+        if handleLongPress(event) { return }
         if handleDragScroll(event) { return }
         super.sendEvent(event)
+    }
+
+    // MARK: - 長押しで一時的にすり抜ける
+
+    /// 長押しとみなすまでの秒数
+    private static let longPressDuration: TimeInterval = 0.4
+    /// カーソルを箱から出さなくても、この秒数で元に戻す
+    private static let passThroughLimit: TimeInterval = 10
+
+    /// いま一時的にすり抜けているか（薄くなり、クリックが後ろのウィンドウに通る）
+    private(set) var isPassingThrough = false
+    /// すり抜けの開始・終了を知らせる。見た目（不透明度）は受け取った側で変える
+    var onPassThroughChange: ((Bool) -> Void)?
+    /// すり抜けに入ってよいか。通知中などは入らせない
+    var canPassThrough: () -> Bool = { true }
+
+    private var isLocked = false
+    private var longPressTimer: Timer?
+    private var passThroughTimer: Timer?
+    private var swallowNextMouseUp = false
+
+    /// 動かさずに押し続けたら、すり抜けに入る。短いクリックやドラッグはこれまでどおり扱う
+    private func handleLongPress(_ event: NSEvent) -> Bool {
+        switch event.type {
+        case .leftMouseDown:
+            longPressTimer?.invalidate()
+            swallowNextMouseUp = false
+            let start = NSEvent.mouseLocation
+            let timer = Timer(timeInterval: Self.longPressDuration, repeats: false) { [weak self] _ in
+                guard let self else { return }
+                // ウィンドウの移動中などはイベントが届かないので、押下と位置は直接確かめる
+                let current = NSEvent.mouseLocation
+                let stayed = abs(current.x - start.x) <= 4 && abs(current.y - start.y) <= 4
+                guard NSEvent.pressedMouseButtons & 1 != 0, stayed, self.canPassThrough() else { return }
+                // 長押しの終わりを予定のクリックとして扱わせない
+                self.swallowNextMouseUp = true
+                self.beginPassThrough()
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            longPressTimer = timer
+            return false
+
+        case .leftMouseUp:
+            longPressTimer?.invalidate()
+            longPressTimer = nil
+            guard swallowNextMouseUp else { return false }
+            swallowNextMouseUp = false
+            return true
+
+        default:
+            return false
+        }
+    }
+
+    /// 一時的にすり抜ける。カーソルが箱の外に出るか、一定時間たつと元に戻る
+    func beginPassThrough() {
+        guard !isPassingThrough, canPassThrough() else { return }
+        isPassingThrough = true
+        ignoresMouseEvents = true
+        onPassThroughChange?(true)
+
+        let startedAt = Date()
+        // メニューバーから入ったときはカーソルが箱の外にあるので、一度入ってから出たときに戻す
+        var wasInside = false
+        let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            let inside = self.frame.contains(NSEvent.mouseLocation)
+            if inside { wasInside = true }
+            let left = wasInside && !inside && NSEvent.pressedMouseButtons == 0
+            if left || Date().timeIntervalSince(startedAt) > Self.passThroughLimit {
+                self.endPassThrough()
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        passThroughTimer = timer
+    }
+
+    func endPassThrough() {
+        passThroughTimer?.invalidate()
+        passThroughTimer = nil
+        guard isPassingThrough else { return }
+        isPassingThrough = false
+        ignoresMouseEvents = isLocked
+        onPassThroughChange?(false)
     }
 
     // MARK: - ドラッグでスクロール
@@ -162,7 +247,8 @@ final class FloatingPanel: NSPanel {
 
     func apply(locked: Bool) {
         // 明示的に false を入れると、透明な部分でもクリックを拾える（移動・リサイズしやすい）
-        ignoresMouseEvents = locked
+        isLocked = locked
+        ignoresMouseEvents = locked || isPassingThrough
         if locked {
             styleMask.remove(.resizable)
         } else {

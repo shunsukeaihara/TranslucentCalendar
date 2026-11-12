@@ -11,6 +11,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private let menu = NSMenu()
     private var cancellables = Set<AnyCancellable>()
+    /// 長押しで一時的にすり抜けている間 true
+    private let passingThrough = CurrentValueSubject<Bool, Never>(false)
+    /// すり抜けている間の全体の不透明度
+    private static let passThroughOpacity = 0.2
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setUpPanel()
@@ -19,10 +23,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         settings.$alwaysOnTop
             .sink { [weak self] in self?.panel.apply(alwaysOnTop: $0) }
             .store(in: &cancellables)
-        // 通知中とリマインダーの入力中は、透けさせていても全体をはっきり見せる
-        Publishers.CombineLatest3(settings.$windowOpacity, store.$activeAlerts, store.$reminderDraft)
-            .sink { [weak self] opacity, alerts, draft in
-                self?.panel.alphaValue = (alerts.isEmpty && draft == nil) ? opacity : 1.0
+        // 通知中とリマインダーの入力中は、透けさせていても全体をはっきり見せる。
+        // 長押しですり抜けている間は、後ろが見えるようにごく薄くする
+        Publishers.CombineLatest4(settings.$windowOpacity, store.$activeAlerts, store.$reminderDraft, passingThrough)
+            .sink { [weak self] opacity, alerts, draft, passing in
+                let alpha: Double
+                if !alerts.isEmpty || draft != nil {
+                    alpha = 1.0
+                } else {
+                    alpha = passing ? min(opacity, Self.passThroughOpacity) : opacity
+                }
+                self?.panel.alphaValue = alpha
+            }
+            .store(in: &cancellables)
+        // 通知や入力が始まったら、すり抜けをやめて操作できる状態に戻す
+        Publishers.CombineLatest(store.$activeAlerts, store.$reminderDraft)
+            .sink { [weak self] alerts, draft in
+                if !alerts.isEmpty || draft != nil { self?.panel.endPassThrough() }
             }
             .store(in: &cancellables)
         store.$activeAlerts
@@ -93,6 +110,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         hosting.sizingOptions = []
         panel.contentView = hosting
         panel.contextMenu = menu
+        panel.canPassThrough = { [weak self] in
+            guard let self else { return false }
+            return self.store.activeAlerts.isEmpty && self.store.reminderDraft == nil
+        }
+        panel.onPassThroughChange = { [weak self] in self?.passingThrough.send($0) }
 
         // 位置とサイズを次回起動時に復元する
         panel.setFrameAutosaveName("MainPanel")
@@ -148,6 +170,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         menu.addItem(item("リマインダーを追加…", action: #selector(addReminder), key: "n"))
+        if panel.canPassThrough() && !settings.locked {
+            menu.addItem(item("一時的にすり抜ける（長押しでも可）", action: #selector(passThrough)))
+        }
         menu.addItem(.separator())
 
         // 全体を完全に透明にすると見失うので下限を設ける
@@ -285,6 +310,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func toggleLocked() {
         settings.locked.toggle()
+    }
+
+    @objc private func passThrough() {
+        panel.beginPassThrough()
     }
 
     @objc private func addReminder() {
