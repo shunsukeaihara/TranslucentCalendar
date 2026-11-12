@@ -16,10 +16,15 @@ struct EventItem: Identifiable {
     let calendarTitle: String
     let notes: String?
     let meetingLinks: [MeetingLink]
+    /// アプリ内のリマインダーなら、その ID
+    var reminderID: UUID? = nil
 
-    /// すでに終わった予定（終了後もしばらく薄く残して表示する）
+    var isReminder: Bool { reminderID != nil }
+
+    /// すでに終わった予定（終了後もしばらく残して表示する）。
+    /// リマインダーは完了にするまで「これから」の側に残す
     func isPast(at now: Date) -> Bool {
-        !isAllDay && end <= now
+        !isAllDay && !isReminder && end <= now
     }
 }
 
@@ -62,6 +67,12 @@ final class CalendarStore: ObservableObject {
     @Published private(set) var now = Date()
     /// クリックして詳細を開いている予定
     @Published var expandedID: String?
+    /// リマインダーの入力欄に書きかけの文字列。入力欄を出していなければ nil
+    @Published var reminderDraft: String?
+    /// リマインダーの入力欄のピッカーで選んでいる日時
+    @Published private(set) var reminderPickerTime = Date()
+    /// 入力欄で修正中のリマインダー。新規に追加しているときは nil
+    @Published private(set) var editingReminderID: UUID?
     /// いま通知中（揺れ・明滅中）の予定と、その段階
     @Published private(set) var activeAlerts: [String: AlertStage] = [:]
 
@@ -157,6 +168,8 @@ final class CalendarStore: ObservableObject {
 
     /// この予定で開始の通知を出すか。予定ごとの指定があればそれを優先する
     func isAlertTarget(_ event: EventItem) -> Bool {
+        // リマインダーは通知の設定に関係なく必ず知らせる
+        if event.isReminder { return true }
         guard !event.isAllDay, settings.alertMode != .off else { return false }
         return settings.alertOverrides[event.seriesID] ?? defaultAlert(for: event)
     }
@@ -177,7 +190,10 @@ final class CalendarStore: ObservableObject {
 
         for event in events where isAlertTarget(event) {
             let untilStart = event.start.timeIntervalSince(now)
-            if untilStart <= 60 && untilStart > 0 {
+            if event.isReminder {
+                // 1分前の通知はなし。スリープ中などに過ぎていた分も、気づいた時点で知らせる
+                if untilStart <= 0, firedStart.insert(event.id).inserted { active[event.id] = .start }
+            } else if untilStart <= 60 && untilStart > 0 {
                 if firedBefore.insert(event.id).inserted { active[event.id] = .before }
             } else if untilStart <= 0 && untilStart > -Self.startAlertWindow && now < event.end {
                 // 1分前の通知を止めてあっても、開始時刻にもう一度出す
@@ -188,7 +204,8 @@ final class CalendarStore: ObservableObject {
         // 終わった予定・消えた予定・対象外になった予定の通知は自動で止める
         let alive = Dictionary(uniqueKeysWithValues: events.map { ($0.id, $0) })
         for id in active.keys where !id.hasPrefix("demo-") {
-            guard let event = alive[id], isAlertTarget(event), now < event.end else {
+            // リマインダーには終わりがないので、止めるまで続ける
+            guard let event = alive[id], isAlertTarget(event), event.isReminder || now < event.end else {
                 active[id] = nil
                 continue
             }
@@ -210,6 +227,166 @@ final class CalendarStore: ObservableObject {
         let lastPast = today?.events.last { $0.isPast(at: now) }
         let focus = alerting?.id ?? lastPast?.id ?? events.first?.id
         if focus != focusID { focusID = focus }
+    }
+
+    // MARK: - リマインダー
+
+    func beginAddingReminder() {
+        guard reminderDraft == nil else { return }
+        // ピッカーの初期値は、30分後を5分単位に切り上げた時刻にする
+        let step: TimeInterval = 5 * 60
+        let base = Date().addingTimeInterval(30 * 60).timeIntervalSinceReferenceDate
+        reminderPickerTime = Date(timeIntervalSinceReferenceDate: (base / step).rounded(.up) * step)
+        editingReminderID = nil
+        reminderDraft = ""
+    }
+
+    /// 登録済みのリマインダーを、追加と同じ入力欄で修正する
+    func beginEditingReminder(_ id: UUID) {
+        guard let reminder = settings.reminders.first(where: { $0.id == id }) else { return }
+        reminderPickerTime = reminder.date
+        editingReminderID = id
+        reminderDraft = reminder.title
+        expandedID = nil
+    }
+
+    func cancelAddingReminder() {
+        reminderDraft = nil
+        editingReminderID = nil
+    }
+
+    /// ピッカーの日時を動かす。分は5分刻みで、時・分は繰り上がらずにその中で一周する
+    func adjustReminderPicker(days: Int = 0, hours: Int = 0, minuteSteps: Int = 0) {
+        let calendar = Calendar.current
+        let today = calendar.startOfDay(for: Date())
+        var day = calendar.startOfDay(for: reminderPickerTime)
+        if days != 0 {
+            day = max(today, calendar.date(byAdding: .day, value: days, to: day) ?? day)
+        }
+        let parts = calendar.dateComponents([.hour, .minute], from: reminderPickerTime)
+        let hour = (((parts.hour ?? 0) + hours) % 24 + 24) % 24
+        var minute = parts.minute ?? 0
+        if minuteSteps > 0 {
+            minute = (minute / 5 + minuteSteps) * 5
+        } else if minuteSteps < 0 {
+            // 5分刻みからずれていたら、まず手前の刻みに揃える
+            minute = minute % 5 == 0 ? minute + minuteSteps * 5 : (minute / 5 + minuteSteps + 1) * 5
+        }
+        minute = (minute % 60 + 60) % 60
+        reminderPickerTime = calendar.date(bySettingHour: hour, minute: minute, second: 0, of: day) ?? reminderPickerTime
+    }
+
+    /// ピッカーの日時で登録できるか。過ぎた日時は不可。
+    /// ただし修正中で日時を動かしていなければ、過ぎていてもそのまま保存できる
+    func isReminderPickerValid(at now: Date) -> Bool {
+        if reminderPickerTime > now { return true }
+        guard let original = settings.reminders.first(where: { $0.id == editingReminderID }) else { return false }
+        return original.date == reminderPickerTime
+    }
+
+    /// 入力欄の内容で登録（修正中なら保存）する。minutes を渡すとその分数だけ後に、
+    /// usePicker ならピッカーの日時にする。どちらも、文言の先頭に書かれた時刻より優先する
+    func commitReminder(afterMinutes minutes: Int? = nil, usePicker: Bool = false) {
+        guard let draft = reminderDraft else { return }
+        let current = Date()
+        let pickerValid = isReminderPickerValid(at: current)
+        // 過ぎた日時のままボタンを押されたら、入力欄を閉じずに選び直してもらう
+        if usePicker && !pickerValid { return }
+
+        let original = settings.reminders.first { $0.id == editingReminderID }
+        reminderDraft = nil
+        editingReminderID = nil
+        let isBlank = draft.trimmingCharacters(in: .whitespaces).isEmpty
+        guard minutes != nil || usePicker || original != nil || !isBlank else { return }
+
+        let parsed = ReminderParser.parse(draft, now: current)
+        var date = minutes.map { current.addingTimeInterval(Double($0) * 60) }
+            ?? (usePicker ? reminderPickerTime : nil)
+            ?? parsed.date
+        if date == nil, let original {
+            // 修正中に Enter だけ押したら、ピッカーの日時（動かしていなければ元のまま）にする
+            date = pickerValid ? reminderPickerTime : original.date
+        }
+        let finalDate = date ?? current.addingTimeInterval(Double(ReminderParser.defaultMinutes) * 60)
+        let title = parsed.title.isEmpty ? (original?.title ?? "リマインダー") : parsed.title
+
+        if let original, let index = settings.reminders.firstIndex(where: { $0.id == original.id }) {
+            settings.reminders[index].title = title
+            settings.reminders[index].date = finalDate
+            if finalDate != original.date {
+                // 日時を変えたら、新しい時刻にあらためて知らせる
+                let itemID = Self.itemID(forReminder: original.id)
+                firedStart.remove(itemID)
+                activeAlerts[itemID] = nil
+            }
+        } else {
+            settings.reminders.append(Reminder(title: title, date: finalDate))
+        }
+        reload()
+    }
+
+    /// 完了（または削除）。一覧から消す
+    func completeReminder(_ id: UUID) {
+        settings.reminders.removeAll { $0.id == id }
+        let itemID = Self.itemID(forReminder: id)
+        if expandedID == itemID { expandedID = nil }
+        reload()
+    }
+
+    /// いまから minutes 分後に知らせ直す
+    func snoozeReminder(_ id: UUID, minutes: Int) {
+        guard let index = settings.reminders.firstIndex(where: { $0.id == id }) else { return }
+        settings.reminders[index].date = Date().addingTimeInterval(Double(minutes) * 60)
+        let itemID = Self.itemID(forReminder: id)
+        firedStart.remove(itemID)
+        activeAlerts[itemID] = nil
+        if expandedID == itemID { expandedID = nil }
+        reload()
+    }
+
+    private static func itemID(forReminder id: UUID) -> String { "reminder-\(id.uuidString)" }
+
+    /// リマインダーを、時刻順で予定の一覧に混ぜる
+    private func injectReminders() {
+        guard !settings.reminders.isEmpty else { return }
+        let calendar = Calendar.current
+        let today = calendar.startOfDay(for: now)
+        var merged = sections
+        for reminder in settings.reminders {
+            // 完了していない過去のリマインダーは今日の欄に出す
+            let day = max(calendar.startOfDay(for: reminder.date), today)
+            let item = EventItem(
+                id: Self.itemID(forReminder: reminder.id),
+                seriesID: "reminder",
+                title: reminder.title,
+                start: reminder.date,
+                end: reminder.date,
+                isAllDay: false,
+                color: .yellow,
+                location: nil,
+                calendarTitle: "リマインダー",
+                notes: nil,
+                meetingLinks: [],
+                reminderID: reminder.id
+            )
+            if let index = merged.firstIndex(where: { $0.date == day }) {
+                merged[index].events = sortedForDisplay(merged[index].events + [item])
+            } else {
+                merged.append(DaySection(date: day, events: [item]))
+                merged.sort { $0.date < $1.date }
+            }
+        }
+        sections = merged
+    }
+
+    private func sortedForDisplay(_ events: [EventItem]) -> [EventItem] {
+        events.sorted {
+            // 終わった予定を先頭に寄せ、その下に終日・これからの予定を並べる
+            if $0.isPast(at: now) != $1.isPast(at: now) { return $0.isPast(at: now) }
+            if $0.isAllDay != $1.isAllDay { return $0.isAllDay }
+            if $0.start != $1.start { return $0.start < $1.start }
+            return $0.title < $1.title
+        }
     }
 
     // MARK: - デモ
@@ -268,6 +445,7 @@ final class CalendarStore: ObservableObject {
 
     func reload() {
         defer {
+            injectReminders()
             injectDemo()
             updateAlerts()
         }
@@ -327,14 +505,7 @@ final class CalendarStore: ObservableObject {
         }
 
         sections = byDay.keys.sorted().map { day in
-            let events = byDay[day]!.sorted {
-                // 終わった予定を先頭に寄せ、その下に終日・これからの予定を並べる
-                if $0.isPast(at: now) != $1.isPast(at: now) { return $0.isPast(at: now) }
-                if $0.isAllDay != $1.isAllDay { return $0.isAllDay }
-                if $0.start != $1.start { return $0.start < $1.start }
-                return $0.title < $1.title
-            }
-            return DaySection(date: day, events: events)
+            DaySection(date: day, events: sortedForDisplay(byDay[day]!))
         }
     }
 }

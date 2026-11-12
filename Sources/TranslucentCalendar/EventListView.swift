@@ -10,12 +10,16 @@ struct EventListView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
+            if let draft = store.reminderDraft {
+                ReminderInputView(draft: draft, scale: scale)
+            }
             content
         }
         .foregroundStyle(.white)
         .shadow(color: .black.opacity(0.6), radius: 1.5, y: 0.5)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .background(Color.black.opacity(settings.opacity))
+        // リマインダーの入力中は、打っている文字が読みやすいよう背景を透かさない
+        .background(Color.black.opacity(store.reminderDraft != nil ? 1.0 : settings.opacity))
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay(alertBorder)
     }
@@ -47,6 +51,26 @@ struct EventListView: View {
         .padding(.bottom, 6)
         .frame(maxWidth: .infinity)
         .overlay(WindowDragHandle())
+        // 移動用の領域より手前に置かないと押せない
+        .overlay(alignment: .trailing) {
+            Button {
+                if store.reminderDraft == nil {
+                    store.beginAddingReminder()
+                } else {
+                    store.cancelAddingReminder()
+                }
+            } label: {
+                Image(systemName: store.reminderDraft == nil ? "plus" : "xmark")
+                    .font(.system(size: 11 * scale, weight: .semibold))
+                    .frame(width: 22 * scale, height: 22 * scale)
+                    .background(Circle().fill(Color.white.opacity(0.18)))
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .help("リマインダーを追加")
+            .padding(.trailing, 12)
+            .padding(.top, 6)
+        }
     }
 
     @ViewBuilder
@@ -201,7 +225,9 @@ private struct EventRow: View {
     }
 
     private var isOngoing: Bool {
-        !event.isAllDay && event.start <= now && now < event.end
+        // 時刻を過ぎて完了していないリマインダーも、進行中の予定と同じく目立たせる
+        if event.isReminder { return event.start <= now }
+        return !event.isAllDay && event.start <= now && now < event.end
     }
 
     var body: some View {
@@ -236,6 +262,20 @@ private struct EventRow: View {
             }
             Spacer(minLength: 0)
 
+            // 時刻を過ぎたリマインダーは、畳んだままでも完了にできるようにする
+            if !isExpanded, let reminderID = event.reminderID, event.start <= now {
+                Button {
+                    store.completeReminder(reminderID)
+                } label: {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 11 * scale, weight: .bold))
+                        .padding(5)
+                        .background(Circle().fill(Color.white.opacity(0.18)))
+                }
+                .buttonStyle(.plain)
+                .help("完了")
+            }
+
             // 畳んだままでもワンクリックで会議に入れるようにする
             if !isExpanded, let link = event.meetingLinks.first {
                 Button {
@@ -262,6 +302,10 @@ private struct EventRow: View {
 
     private var details: some View {
         VStack(alignment: .leading, spacing: 6) {
+            if let reminderID = event.reminderID {
+                reminderActions(reminderID)
+            }
+
             ForEach(event.meetingLinks) { link in
                 Button {
                     NSWorkspace.shared.open(link.url)
@@ -284,7 +328,7 @@ private struct EventRow: View {
                     .opacity(0.85)
             }
 
-            if settings.alertMode != .off && !event.isAllDay && !event.id.hasPrefix("demo-") {
+            if settings.alertMode != .off && !event.isAllDay && !event.isReminder && !event.id.hasPrefix("demo-") {
                 Toggle("この予定の開始を揺れと明滅で知らせる", isOn: Binding(
                     get: { store.isAlertTarget(event) },
                     set: { store.setAlert($0, for: event) }
@@ -300,9 +344,63 @@ private struct EventRow: View {
         .padding(.top, 5)
     }
 
+    /// リマインダーの完了（まだ時刻前なら削除）と、あとで知らせ直すボタン
+    private func reminderActions(_ id: UUID) -> some View {
+        let isDue = event.start <= now
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Button {
+                    store.completeReminder(id)
+                } label: {
+                    Label(isDue ? "完了" : "削除", systemImage: isDue ? "checkmark" : "trash")
+                        .font(.system(size: 12 * scale, weight: .semibold))
+                        .padding(.vertical, 4)
+                        .padding(.horizontal, 10)
+                        .background(Capsule().fill(isDue ? Color.green.opacity(0.75) : Color.white.opacity(0.2)))
+                }
+                .buttonStyle(.plain)
+
+                Button {
+                    store.beginEditingReminder(id)
+                } label: {
+                    Label("修正", systemImage: "pencil")
+                        .font(.system(size: 12 * scale, weight: .semibold))
+                        .padding(.vertical, 4)
+                        .padding(.horizontal, 10)
+                        .background(Capsule().fill(Color.white.opacity(0.2)))
+                }
+                .buttonStyle(.plain)
+            }
+
+            HStack(spacing: 5) {
+                Text(isDue ? "あとで" : "変更")
+                    .font(.system(size: 11 * scale))
+                    .opacity(0.7)
+                ForEach(ReminderInputView.presets, id: \.minutes) { preset in
+                    Button {
+                        store.snoozeReminder(id, minutes: preset.minutes)
+                    } label: {
+                        Text(preset.label)
+                            .font(.system(size: 11 * scale))
+                            .padding(.vertical, 3)
+                            .padding(.horizontal, 8)
+                            .background(Capsule().fill(Color.white.opacity(0.2)))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+
     private var timeText: String {
         if event.isAllDay { return "終日" }
         let calendar = Calendar.current
+        if event.isReminder {
+            let time = calendar.isDate(event.start, inSameDayAs: day)
+                ? Formatters.time.string(from: event.start) : Formatters.dateTime.string(from: event.start)
+            if alertStage != nil { return "\(time)  時間です" }
+            return event.start <= now ? "\(time)  未完了" : time
+        }
         let startsBefore = event.start < day
         let endsAfter = !calendar.isDate(event.end, inSameDayAs: day)
             && event.end != calendar.date(byAdding: .day, value: 1, to: day)
@@ -315,6 +413,209 @@ private struct EventRow: View {
         }
         if isPast { return "\(start) – \(end)  終了" }
         return isOngoing ? "\(start) – \(end)  進行中" : "\(start) – \(end)"
+    }
+}
+
+/// リマインダーを1行で登録する入力欄。「15 洗濯物」「14:30 歯医者に電話」のように書く
+private struct ReminderInputView: View {
+    static let presets: [(label: String, minutes: Int)] = [("5分後", 5), ("15分後", 15), ("30分後", 30), ("1時間後", 60)]
+
+    let draft: String
+    let scale: CGFloat
+
+    @EnvironmentObject private var store: CalendarStore
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            ReminderTextField(
+                text: Binding(get: { store.reminderDraft ?? "" }, set: { store.reminderDraft = $0 }),
+                fontSize: 13 * scale,
+                onCommit: { store.commitReminder() },
+                onCancel: { store.cancelAddingReminder() }
+            )
+            .frame(height: 20 * scale)
+            .padding(.vertical, 4)
+            .padding(.horizontal, 8)
+            .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color.white.opacity(0.18)))
+
+            Text(preview)
+                .font(.system(size: 10 * scale).monospacedDigit())
+                .opacity(0.75)
+
+            HStack(spacing: 5) {
+                ForEach(Self.presets, id: \.minutes) { preset in
+                    Button {
+                        store.commitReminder(afterMinutes: preset.minutes)
+                    } label: {
+                        Text(preset.label)
+                            .font(.system(size: 11 * scale))
+                            .padding(.vertical, 3)
+                            .padding(.horizontal, 8)
+                            .background(Capsule().fill(Color.white.opacity(0.2)))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            // 日時をきっちり決めたいとき用。小さな欄を狙わなくて済むよう、大きめのボタンで動かす
+            HStack(spacing: 4) {
+                stepButton("chevron.left", width: 30) { store.adjustReminderPicker(days: -1) }
+                Text(dayLabel)
+                    .font(.system(size: 12 * scale, weight: .medium).monospacedDigit())
+                    .frame(maxWidth: .infinity)
+                stepButton("chevron.right", width: 30) { store.adjustReminderPicker(days: 1) }
+            }
+            .padding(.top, 2)
+
+            HStack(spacing: 6) {
+                spinner(value: pickerPart(.hour), pad: false) { store.adjustReminderPicker(hours: $0) }
+                Text(":")
+                    .font(.system(size: 20 * scale, weight: .semibold))
+                spinner(value: pickerPart(.minute), pad: true) { store.adjustReminderPicker(minuteSteps: $0) }
+                Spacer(minLength: 4)
+                Button {
+                    store.commitReminder(usePicker: true)
+                } label: {
+                    Text(pickerButtonLabel)
+                        .font(.system(size: 12 * scale, weight: .semibold))
+                        .multilineTextAlignment(.center)
+                        .padding(.vertical, 8)
+                        .padding(.horizontal, 12)
+                        .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color.blue.opacity(0.85)))
+                }
+                .buttonStyle(.plain)
+                .opacity(pickerValid ? 1 : 0.4)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.bottom, 8)
+    }
+
+    private var pickerValid: Bool { store.isReminderPickerValid(at: store.now) }
+
+    private var pickerButtonLabel: String {
+        if !pickerValid { return "過ぎた\n時刻です" }
+        return store.editingReminderID == nil ? "この日時で\n登録" : "この日時に\n変更"
+    }
+
+    private var dayLabel: String {
+        let calendar = Calendar.current
+        let date = store.reminderPickerTime
+        let text = Formatters.sectionDate.string(from: date)
+        if calendar.isDateInToday(date) { return "今日  \(text)" }
+        if calendar.isDateInTomorrow(date) { return "明日  \(text)" }
+        return text
+    }
+
+    private func pickerPart(_ component: Calendar.Component) -> Int {
+        Calendar.current.component(component, from: store.reminderPickerTime)
+    }
+
+    private func stepButton(_ symbol: String, width: CGFloat, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 11 * scale, weight: .bold))
+                .frame(width: width * scale, height: 20 * scale)
+                .background(RoundedRectangle(cornerRadius: 5, style: .continuous).fill(Color.white.opacity(0.18)))
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// 数字の上下に大きめのボタンを置いた、時・分用のつまみ
+    private func spinner(value: Int, pad: Bool, step: @escaping (Int) -> Void) -> some View {
+        VStack(spacing: 2) {
+            stepButton("chevron.up", width: 44) { step(1) }
+            Text(pad ? String(format: "%02d", value) : String(value))
+                .font(.system(size: 22 * scale, weight: .semibold).monospacedDigit())
+            stepButton("chevron.down", width: 44) { step(-1) }
+        }
+    }
+
+    /// 書いた内容がいつの通知になるかを、登録前に見せる
+    private var preview: String {
+        if draft.trimmingCharacters(in: .whitespaces).isEmpty {
+            return "例: 15 洗濯物 ／ 1h 郵便局 ／ 14:30 電話"
+        }
+        guard let date = ReminderParser.parse(draft, now: store.now).date else {
+            if store.editingReminderID != nil { return "Enter で保存（日時は下で変更できます）" }
+            return "Enter で\(ReminderParser.defaultMinutes)分後に通知（下のボタンでも選べます）"
+        }
+        let calendar = Calendar.current
+        let time = Formatters.time.string(from: date)
+        if calendar.isDateInToday(date) { return "Enter で \(time) に通知" }
+        if calendar.isDateInTomorrow(date) { return "Enter で 明日 \(time) に通知" }
+        return "Enter で \(Formatters.dateTime.string(from: date)) に通知"
+    }
+}
+
+/// 枠なしのパネルでも確実に文字を打てるよう、AppKit の入力欄をそのまま使う。
+/// 出てきたらすぐ打てるようにフォーカスを取り、Enter で登録、Esc で取り消す
+private struct ReminderTextField: NSViewRepresentable {
+    let text: Binding<String>
+    let fontSize: CGFloat
+    let onCommit: () -> Void
+    let onCancel: () -> Void
+
+    final class Field: NSTextField {
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            guard let window else { return }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.window === window else { return }
+                window.makeKey()
+                window.makeFirstResponder(self)
+            }
+        }
+    }
+
+    final class Coordinator: NSObject, NSTextFieldDelegate {
+        var parent: ReminderTextField
+        init(_ parent: ReminderTextField) { self.parent = parent }
+
+        func controlTextDidChange(_ notification: Notification) {
+            guard let field = notification.object as? NSTextField else { return }
+            parent.text.wrappedValue = field.stringValue
+        }
+
+        func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
+            if selector == #selector(NSResponder.insertNewline(_:)) {
+                parent.text.wrappedValue = control.stringValue
+                parent.onCommit()
+                return true
+            }
+            if selector == #selector(NSResponder.cancelOperation(_:)) {
+                parent.onCancel()
+                return true
+            }
+            return false
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeNSView(context: Context) -> NSTextField {
+        let field = Field()
+        field.delegate = context.coordinator
+        field.isBordered = false
+        field.drawsBackground = false
+        field.focusRingType = .none
+        field.textColor = .white
+        field.usesSingleLineMode = true
+        field.cell?.isScrollable = true
+        field.cell?.wraps = false
+        field.placeholderAttributedString = NSAttributedString(
+            string: "リマインダー",
+            attributes: [.foregroundColor: NSColor.white.withAlphaComponent(0.45),
+                         .font: NSFont.systemFont(ofSize: fontSize)])
+        return field
+    }
+
+    func updateNSView(_ field: NSTextField, context: Context) {
+        context.coordinator.parent = self
+        field.font = .systemFont(ofSize: fontSize)
+        // 変換中の文字を壊さないよう、外から書き換えられたときだけ反映する
+        if field.stringValue != text.wrappedValue { field.stringValue = text.wrappedValue }
     }
 }
 

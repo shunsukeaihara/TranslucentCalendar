@@ -40,6 +40,11 @@ final class Settings: ObservableObject {
         didSet { defaults.set(Array(hiddenCalendarIDs), forKey: "hiddenCalendarIDs") }
     }
 
+    /// アプリ内だけに保存するリマインダー
+    @Published var reminders: [Reminder] {
+        didSet { defaults.set(try? JSONEncoder().encode(reminders), forKey: "reminders") }
+    }
+
     private init() {
         defaults.register(defaults: [
             "opacity": 0.55,
@@ -59,5 +64,7 @@ final class Settings: ObservableObject {
         alertMode = AlertMode(rawValue: defaults.string(forKey: "alertMode") ?? "") ?? .meetings
         alertOverrides = (defaults.dictionary(forKey: "alertOverrides") as? [String: Bool]) ?? [:]
         hiddenCalendarIDs = Set(defaults.stringArray(forKey: "hiddenCalendarIDs") ?? [])
+        reminders = defaults.data(forKey: "reminders")
+            .flatMap { try? JSONDecoder().decode([Reminder].self, from: $0) } ?? []
     }
 }

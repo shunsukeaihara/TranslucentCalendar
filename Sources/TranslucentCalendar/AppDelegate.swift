@@ -19,9 +19,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         settings.$alwaysOnTop
             .sink { [weak self] in self?.panel.apply(alwaysOnTop: $0) }
             .store(in: &cancellables)
-        // 通知中は、透けさせていても全体をはっきり見せる
-        Publishers.CombineLatest(settings.$windowOpacity, store.$activeAlerts)
-            .sink { [weak self] opacity, alerts in self?.panel.alphaValue = alerts.isEmpty ? opacity : 1.0 }
+        // 通知中とリマインダーの入力中は、透けさせていても全体をはっきり見せる
+        Publishers.CombineLatest3(settings.$windowOpacity, store.$activeAlerts, store.$reminderDraft)
+            .sink { [weak self] opacity, alerts, draft in
+                self?.panel.alphaValue = (alerts.isEmpty && draft == nil) ? opacity : 1.0
+            }
             .store(in: &cancellables)
         store.$activeAlerts
             .map { $0.values.max() }
@@ -144,6 +146,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(item("通知を停止", action: #selector(stopAlerts)))
             menu.addItem(.separator())
         }
+
+        menu.addItem(item("リマインダーを追加…", action: #selector(addReminder), key: "n"))
+        menu.addItem(.separator())
 
         // 全体を完全に透明にすると見失うので下限を設ける
         menu.addItem(makeSliderItem("全体の不透明度", value: settings.windowOpacity, min: 0.15,
@@ -280,6 +285,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func toggleLocked() {
         settings.locked.toggle()
+    }
+
+    @objc private func addReminder() {
+        panel.orderFrontRegardless()
+        store.beginAddingReminder()
     }
 
     @objc private func runDemo() {
